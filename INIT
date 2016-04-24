@@ -1,0 +1,24 @@
+     writel(0x00000600, ioaddr + TCR); /* DMA burst size 1024 */
+
+        /* init Tx buffer DMA addresses */
+        for (i = 0; i < NUM_TX_DESC; i++) {
+               writel(tp->tx_bufs_dma + (tp->tx_buf[i] - tp->tx_bufs),
+                                      ioaddr + TSAD0 + (i * 4));
+        }
+
+        /* Enable all known interrupts by setting the interrupt mask. */
+        writew(INT_MASK, ioaddr + IMR);
+
+        netif_start_queue (dev);
+        return;
+}
+
+static void rtl8139_chip_reset (void *ioaddr)
+{
+        int i;
+
+        /* Soft reset the chip. */
+        writeb(CmdReset, ioaddr + CR);
+
+        /* Check that the chip has finished the reset. */
+        for (i = 1000; i > 0;
