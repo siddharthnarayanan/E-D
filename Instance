@@ -1,0 +1,96 @@
+ struct rtl8139_private *tp = dev->priv;
+        void *ioaddr = tp->mmio_addr;
+        unsigned short isr = readw(ioaddr + ISR);
+        
+        /* clear all interrupt.
+         * Specs says reading ISR clears all interrupts and writing
+         * has no effect. But this does not seem to be case. I keep on
+         * getting interrupt unless I forcibly clears all interrupt :-(
+         */
+        writew(0xffff, ioaddr + ISR);
+
+        if((isr & TxOK) || (isr & TxErr)) 
+        {
+               while((tp->dirty_tx != tp->cur_tx) || netif_queue_stopped(dev))
+               {
+                       unsigned int txstatus = 
+                               readl(ioaddr + TSD0 + tp->dirty_tx * sizeof(int));
+
+                       if(!(txstatus & (TxStatOK | TxAborted | TxUnderrun)))
+                               break; /* yet not transmitted */
+
+                       if(txstatus & TxStatOK) {
+                               LOG_MSG("Transmit OK interrupt\n");
+                               tp->stats.tx_bytes += (txstatus & 0x1fff);
+                               tp->stats.tx_packets++;
+                       }
+                       else {
+                               LOG_MSG("Transmit Error interrupt\n");
+                               tp->stats.tx_errors++;
+                       }
+                               
+                       tp->dirty_tx++;
+                       tp->dirty_tx = tp->dirty_tx % NUM_TX_DESC;
+
+                       if((tp->dirty_tx == tp->cur_tx) & netif_queue_stopped(dev))
+                       {
+                               LOG_MSG("waking up queue\n");
+                               netif_wake_queue(dev);
+                       }
+               }
+        }
+
+        if(isr & RxErr) {
+               /* TODO: Need detailed analysis of error status */
+               LOG_MSG("receive err interrupt\n");
+               tp->stats.rx_errors++;
+        }
+
+        if(isr & RxOK) {
+               LOG_MSG("receive interrupt received\n");
+               while((readb(ioaddr + CR) & RxBufEmpty) == 0)
+               {
+                       unsigned int rx_status;
+                       unsigned short rx_size;
+                       unsigned short pkt_size;
+                       struct sk_buff *skb;
+
+                       if(tp->cur_rx > RX_BUF_LEN)
+                               tp->cur_rx = tp->cur_rx % RX_BUF_LEN;
+        
+          
+                               skb->dev = dev;
+                               skb_reserve (skb, 2); /* 16 byte align the IP fields */
+
+                               eth_copy_and_sum(
+                                      skb, tp->rx_ring + tp->cur_rx + 4, pkt_size, 0);
+
+                               skb_put (skb, pkt_size);
+                               skb->protocol = eth_type_trans (skb, dev);
+                               netif_rx (skb);
+
+                               dev->last_rx = jiffies;
+                               tp->stats.rx_bytes += pkt_size;
+                               tp->stats.rx_packets++;
+                       } 
+                       else {
+                               LOG_MSG("Memory squeeze, dropping packet.\n");
+                               tp->stats.rx_dropped++;
+                       }
+               
+                       /* update tp->cur_rx to next writing location  * /
+                       tp->cur_rx = (tp->cur_rx + rx_size + 4 + 3) & ~3;
+
+                       /* update CAPR */
+                       writew(tp->cur_rx, ioaddr + CAPR);
+               }
+        }
+        
+        if(isr & CableLen)
+               LOG_MSG("cable length change interrupt\n");
+        if(isr & TimeOut)
+               LOG_MSG("time interrupt\n");
+        if(isr & SysErr)
+               LOG_MSG("system err interrupt\n");
+        return;
+}
