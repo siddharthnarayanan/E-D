@@ -1,0 +1,451 @@
+679 
+680         /* Passing the self-test is a pretty good indication
+681          * that the device can DMA to/from host memory */
+682 
+683         nic->mem->selftest.signature = 0;
+684         nic->mem->selftest.result = 0xFFFFFFFF;
+685 
+686         iowrite32(selftest | dma_addr, &nic->csr->port);
+687         e100_write_flush(nic);
+688         /* Wait 10 msec for self-test to complete */
+689         msleep(10);
+690 
+691         /* Interrupts are enabled after self-test */
+692         e100_disable_irq(nic);
+693 
+694         /* Check results of self-test */
+695         if (nic->mem->selftest.result != 0) {
+696                 netif_err(nic, hw, nic->netdev,
+697                           "Self-test failed: result=0x%08X\n",
+698                           nic->mem->selftest.result);
+699                 return -ETIMEDOUT;
+700         }
+701         if (nic->mem->selftest.signature == 0) {
+702                 netif_err(nic, hw, nic->netdev, "Self-test failed: timed out\n");
+703                 return -ETIMEDOUT;
+704         }
+705 
+706         return 0;
+707 }
+708 
+709 static void e100_eeprom_write(struct nic *nic, u16 addr_len, u16 addr, __le16 data)
+710 {
+711         u32 cmd_addr_data[3];
+712         u8 ctrl;
+713         int i, j;
+714 
+715         /* Three cmds: write/erase enable, write data, write/erase disable */
+716         cmd_addr_data[0] = op_ewen << (addr_len - 2);
+717         cmd_addr_data[1] = (((op_write << addr_len) | addr) << 16) |
+718                 le16_to_cpu(data);
+719         cmd_addr_data[2] = op_ewds << (addr_len - 2);
+720 
+721         /* Bit-bang cmds to write word to eeprom */
+722         for (j = 0; j < 3; j++) {
+723 
+724                 /* Chip select */
+725                 iowrite8(eecs | eesk, &nic->csr->eeprom_ctrl_lo);
+726                 e100_write_flush(nic); udelay(4);
+727 
+728                 for (i = 31; i >= 0; i--) {
+729                         ctrl = (cmd_addr_data[j] & (1 << i)) ?
+730                                 eecs | eedi : eecs;
+731                         iowrite8(ctrl, &nic->csr->eeprom_ctrl_lo);
+732                         e100_write_flush(nic); udelay(4);
+733 
+734                         iowrite8(ctrl | eesk, &nic->csr->eeprom_ctrl_lo);
+735                         e100_write_flush(nic); udelay(4);
+736                 }
+737                 /* Wait 10 msec for cmd to complete */
+738                 msleep(10);
+739 
+740                 /* Chip deselect */
+741                 iowrite8(0, &nic->csr->eeprom_ctrl_lo);
+742                 e100_write_flush(nic); udelay(4);
+743         }
+744 };
+745 
+746 /* General technique stolen from the eepro100 driver - very clever */
+747 static __le16 e100_eeprom_read(struct nic *nic, u16 *addr_len, u16 addr)
+748 {
+749         u32 cmd_addr_data;
+750         u16 data = 0;
+751         u8 ctrl;
+752         int i;
+753 
+754         cmd_addr_data = ((op_read << *addr_len) | addr) << 16;
+755 
+756         /* Chip select */
+757         iowrite8(eecs | eesk, &nic->csr->eeprom_ctrl_lo);
+758         e100_write_flush(nic); udelay(4);
+759 
+760         /* Bit-bang to read word from eeprom */
+761         for (i = 31; i >= 0; i--) {
+762                 ctrl = (cmd_addr_data & (1 << i)) ? eecs | eedi : eecs;
+763                 iowrite8(ctrl, &nic->csr->eeprom_ctrl_lo);
+764                 e100_write_flush(nic); udelay(4);
+765 
+766                 iowrite8(ctrl | eesk, &nic->csr->eeprom_ctrl_lo);
+767                 e100_write_flush(nic); udelay(4);
+768 
+769                 /* Eeprom drives a dummy zero to EEDO after receiving
+770                  * complete address.  Use this to adjust addr_len. */
+771                 ctrl = ioread8(&nic->csr->eeprom_ctrl_lo);
+772                 if (!(ctrl & eedo) && i > 16) {
+773                         *addr_len -= (i - 16);
+774                         i = 17;
+775                 }
+776 
+777                 data = (data << 1) | (ctrl & eedo ? 1 : 0);
+778         }
+779 
+780         /* Chip deselect */
+781         iowrite8(0, &nic->csr->eeprom_ctrl_lo);
+782         e100_write_flush(nic); udelay(4);
+783 
+784         return cpu_to_le16(data);
+785 };
+786 
+787 /* Load entire EEPROM image into driver cache and validate checksum */
+788 static int e100_eeprom_load(struct nic *nic)
+789 {
+790         u16 addr, addr_len = 8, checksum = 0;
+791 
+792         /* Try reading with an 8-bit addr len to discover actual addr len */
+793         e100_eeprom_read(nic, &addr_len, 0);
+794         nic->eeprom_wc = 1 << addr_len;
+795 
+796         for (addr = 0; addr < nic->eeprom_wc; addr++) {
+797                 nic->eeprom[addr] = e100_eeprom_read(nic, &addr_len, addr);
+798                 if (addr < nic->eeprom_wc - 1)
+799                         checksum += le16_to_cpu(nic->eeprom[addr]);
+800         }
+801 
+802         /* The checksum, stored in the last word, is calculated such that
+803          * the sum of words should be 0xBABA */
+804         if (cpu_to_le16(0xBABA - checksum) != nic->eeprom[nic->eeprom_wc - 1]) {
+805                 netif_err(nic, probe, nic->netdev, "EEPROM corrupted\n");
+806                 if (!eeprom_bad_csum_allow)
+807                         return -EAGAIN;
+808         }
+809 
+810         return 0;
+811 }
+812 
+813 /* Save (portion of) driver EEPROM cache to device and update checksum */
+814 static int e100_eeprom_save(struct nic *nic, u16 start, u16 count)
+815 {
+816         u16 addr, addr_len = 8, checksum = 0;
+817 
+818         /* Try reading with an 8-bit addr len to discover actual addr len */
+819         e100_eeprom_read(nic, &addr_len, 0);
+820         nic->eeprom_wc = 1 << addr_len;
+821 
+822         if (start + count >= nic->eeprom_wc)
+823                 return -EINVAL;
+824 
+825         for (addr = start; addr < start + count; addr++)
+826                 e100_eeprom_write(nic, addr_len, addr, nic->eeprom[addr]);
+827 
+828         /* The checksum, stored in the last word, is calculated such that
+829          * the sum of words should be 0xBABA */
+830         for (addr = 0; addr < nic->eeprom_wc - 1; addr++)
+831                 checksum += le16_to_cpu(nic->eeprom[addr]);
+832         nic->eeprom[nic->eeprom_wc - 1] = cpu_to_le16(0xBABA - checksum);
+833         e100_eeprom_write(nic, addr_len, nic->eeprom_wc - 1,
+834                 nic->eeprom[nic->eeprom_wc - 1]);
+835 
+836         return 0;
+837 }
+838 
+839 #define E100_WAIT_SCB_TIMEOUT 20000 /* we might have to wait 100ms!!! */
+840 #define E100_WAIT_SCB_FAST 20       /* delay like the old code */
+841 static int e100_exec_cmd(struct nic *nic, u8 cmd, dma_addr_t dma_addr)
+842 {
+843         unsigned long flags;
+844         unsigned int i;
+845         int err = 0;
+846 
+847         spin_lock_irqsave(&nic->cmd_lock, flags);
+848 
+849         /* Previous command is accepted when SCB clears */
+850         for (i = 0; i < E100_WAIT_SCB_TIMEOUT; i++) {
+851                 if (likely(!ioread8(&nic->csr->scb.cmd_lo)))
+852                         break;
+853                 cpu_relax();
+854                 if (unlikely(i > E100_WAIT_SCB_FAST))
+855                         udelay(5);
+856         }
+857         if (unlikely(i == E100_WAIT_SCB_TIMEOUT)) {
+858                 err = -EAGAIN;
+859                 goto err_unlock;
+860         }
+861 
+862         if (unlikely(cmd != cuc_resume))
+863                 iowrite32(dma_addr, &nic->csr->scb.gen_ptr);
+864         iowrite8(cmd, &nic->csr->scb.cmd_lo);
+865 
+866 err_unlock:
+867         spin_unlock_irqrestore(&nic->cmd_lock, flags);
+868 
+869         return err;
+870 }
+871 
+872 static int e100_exec_cb(struct nic *nic, struct sk_buff *skb,
+873         int (*cb_prepare)(struct nic *, struct cb *, struct sk_buff *))
+874 {
+875         struct cb *cb;
+876         unsigned long flags;
+877         int err;
+878 
+879         spin_lock_irqsave(&nic->cb_lock, flags);
+880 
+881         if (unlikely(!nic->cbs_avail)) {
+882                 err = -ENOMEM;
+883                 goto err_unlock;
+884         }
+885 
+886         cb = nic->cb_to_use;
+887         nic->cb_to_use = cb->next;
+888         nic->cbs_avail--;
+889         cb->skb = skb;
+890 
+891         err = cb_prepare(nic, cb, skb);
+892         if (err)
+893                 goto err_unlock;
+894 
+895         if (unlikely(!nic->cbs_avail))
+896                 err = -ENOSPC;
+897 
+898 
+899         /* Order is important otherwise we'll be in a race with h/w:
+900          * set S-bit in current first, then clear S-bit in previous. */
+901         cb->command |= cpu_to_le16(cb_s);
+902         dma_wmb();
+903         cb->prev->command &= cpu_to_le16(~cb_s);
+904 
+905         while (nic->cb_to_send != nic->cb_to_use) {
+906                 if (unlikely(e100_exec_cmd(nic, nic->cuc_cmd,
+907                         nic->cb_to_send->dma_addr))) {
+908                         /* Ok, here's where things get sticky.  It's
+909                          * possible that we can't schedule the command
+910                          * because the controller is too busy, so
+911                          * let's just queue the command and try again
+912                          * when another command is scheduled. */
+913                         if (err == -ENOSPC) {
+914                                 //request a reset
+915                                 schedule_work(&nic->tx_timeout_task);
+916                         }
+917                         break;
+918                 } else {
+919                         nic->cuc_cmd = cuc_resume;
+920                         nic->cb_to_send = nic->cb_to_send->next;
+921                 }
+922         }
+923 
+924 err_unlock:
+925         spin_unlock_irqrestore(&nic->cb_lock, flags);
+926 
+927         return err;
+928 }
+929 
+930 static int mdio_read(struct net_device *netdev, int addr, int reg)
+931 {
+932         struct nic *nic = netdev_priv(netdev);
+933         return nic->mdio_ctrl(nic, addr, mdi_read, reg, 0);
+934 }
+935 
+936 static void mdio_write(struct net_device *netdev, int addr, int reg, int data)
+937 {
+938         struct nic *nic = netdev_priv(netdev);
+939 
+940         nic->mdio_ctrl(nic, addr, mdi_write, reg, data);
+941 }
+942 
+943 /* the standard mdio_ctrl() function for usual MII-compliant hardware */
+944 static u16 mdio_ctrl_hw(struct nic *nic, u32 addr, u32 dir, u32 reg, u16 data)
+945 {
+946         u32 data_out = 0;
+947         unsigned int i;
+948         unsigned long flags;
+949 
+950 
+951         /*
+952          * Stratus87247: we shouldn't be writing the MDI control
+953          * register until the Ready bit shows True.  Also, since
+954          * manipulation of the MDI control registers is a multi-step
+955          * procedure it should be done under lock.
+956          */
+957         spin_lock_irqsave(&nic->mdio_lock, flags);
+958         for (i = 100; i; --i) {
+959                 if (ioread32(&nic->csr->mdi_ctrl) & mdi_ready)
+960                         break;
+961                 udelay(20);
+962         }
+963         if (unlikely(!i)) {
+964                 netdev_err(nic->netdev, "e100.mdio_ctrl won't go Ready\n");
+965                 spin_unlock_irqrestore(&nic->mdio_lock, flags);
+966                 return 0;               /* No way to indicate timeout error */
+967         }
+968         iowrite32((reg << 16) | (addr << 21) | dir | data, &nic->csr->mdi_ctrl);
+969 
+970         for (i = 0; i < 100; i++) {
+971                 udelay(20);
+972                 if ((data_out = ioread32(&nic->csr->mdi_ctrl)) & mdi_ready)
+973                         break;
+974         }
+975         spin_unlock_irqrestore(&nic->mdio_lock, flags);
+976         netif_printk(nic, hw, KERN_DEBUG, nic->netdev,
+977                      "%s:addr=%d, reg=%d, data_in=0x%04X, data_out=0x%04X\n",
+978                      dir == mdi_read ? "READ" : "WRITE",
+979                      addr, reg, data, data_out);
+980         return (u16)data_out;
+981 }
+982 
+983 /* slightly tweaked mdio_ctrl() function for phy_82552_v specifics */
+984 static u16 mdio_ctrl_phy_82552_v(struct nic *nic,
+985                                  u32 addr,
+986                                  u32 dir,
+987                                  u32 reg,
+988                                  u16 data)
+989 {
+990         if ((reg == MII_BMCR) && (dir == mdi_write)) {
+991                 if (data & (BMCR_ANRESTART | BMCR_ANENABLE)) {
+992                         u16 advert = mdio_read(nic->netdev, nic->mii.phy_id,
+993                                                         MII_ADVERTISE);
+994 
+995                         /*
+996                          * Workaround Si issue where sometimes the part will not
+997                          * autoneg to 100Mbps even when advertised.
+998                          */
+999                         if (advert & ADVERTISE_100FULL)
+1000                                 data |= BMCR_SPEED100 | BMCR_FULLDPLX;
+1001                         else if (advert & ADVERTISE_100HALF)
+1002                                 data |= BMCR_SPEED100;
+1003                 }
+1004         }
+1005         return mdio_ctrl_hw(nic, addr, dir, reg, data);
+1006 }
+1007 
+1008 /* Fully software-emulated mdio_ctrl() function for cards without
+1009  * MII-compliant PHYs.
+1010  * For now, this is mainly geared towards 80c24 support; in case of further
+1011  * requirements for other types (i82503, ...?) either extend this mechanism
+1012  * or split it, whichever is cleaner.
+1013  */
+1014 static u16 mdio_ctrl_phy_mii_emulated(struct nic *nic,
+1015                                       u32 addr,
+1016                                       u32 dir,
+1017                                       u32 reg,
+1018                                       u16 data)
+1019 {
+1020         /* might need to allocate a netdev_priv'ed register array eventually
+1021          * to be able to record state changes, but for now
+1022          * some fully hardcoded register handling ought to be ok I guess. */
+1023 
+1024         if (dir == mdi_read) {
+1025                 switch (reg) {
+1026                 case MII_BMCR:
+1027                         /* Auto-negotiation, right? */
+1028                         return  BMCR_ANENABLE |
+1029                                 BMCR_FULLDPLX;
+1030                 case MII_BMSR:
+1031                         return  BMSR_LSTATUS /* for mii_link_ok() */ |
+1032                                 BMSR_ANEGCAPABLE |
+1033                                 BMSR_10FULL;
+1034                 case MII_ADVERTISE:
+1035                         /* 80c24 is a "combo card" PHY, right? */
+1036                         return  ADVERTISE_10HALF |
+1037                                 ADVERTISE_10FULL;
+1038                 default:
+1039                         netif_printk(nic, hw, KERN_DEBUG, nic->netdev,
+1040                                      "%s:addr=%d, reg=%d, data=0x%04X: unimplemented emulation!\n",
+1041                                      dir == mdi_read ? "READ" : "WRITE",
+1042                                      addr, reg, data);
+1043                         return 0xFFFF;
+1044                 }
+1045         } else {
+1046                 switch (reg) {
+1047                 default:
+1048                         netif_printk(nic, hw, KERN_DEBUG, nic->netdev,
+1049                                      "%s:addr=%d, reg=%d, data=0x%04X: unimplemented emulation!\n",
+1050                                      dir == mdi_read ? "READ" : "WRITE",
+1051                                      addr, reg, data);
+1052                         return 0xFFFF;
+1053                 }
+1054         }
+1055 }
+1056 static inline int e100_phy_supports_mii(struct nic *nic)
+1057 {
+1058         /* for now, just check it by comparing whether we
+1059            are using MII software emulation.
+1060         */
+1061         return (nic->mdio_ctrl != mdio_ctrl_phy_mii_emulated);
+1062 }
+1063 
+1064 static void e100_get_defaults(struct nic *nic)
+1065 {
+1066         struct param_range rfds = { .min = 16, .max = 256, .count = 256 };
+1067         struct param_range cbs  = { .min = 64, .max = 256, .count = 128 };
+1068 
+1069         /* MAC type is encoded as rev ID; exception: ICH is treated as 82559 */
+1070         nic->mac = (nic->flags & ich) ? mac_82559_D101M : nic->pdev->revision;
+1071         if (nic->mac == mac_unknown)
+1072                 nic->mac = mac_82557_D100_A;
+1073 
+1074         nic->params.rfds = rfds;
+1075         nic->params.cbs = cbs;
+1076 
+1077         /* Quadwords to DMA into FIFO before starting frame transmit */
+1078         nic->tx_threshold = 0xE0;
+1079 
+1080         /* no interrupt for every tx completion, delay = 256us if not 557 */
+1081         nic->tx_command = cpu_to_le16(cb_tx | cb_tx_sf |
+1082                 ((nic->mac >= mac_82558_D101_A4) ? cb_cid : cb_i));
+1083 
+1084         /* Template for a freshly allocated RFD */
+1085         nic->blank_rfd.command = 0;
+1086         nic->blank_rfd.rbd = cpu_to_le32(0xFFFFFFFF);
+1087         nic->blank_rfd.size = cpu_to_le16(VLAN_ETH_FRAME_LEN + ETH_FCS_LEN);
+1088 
+1089         /* MII setup */
+1090         nic->mii.phy_id_mask = 0x1F;
+1091         nic->mii.reg_num_mask = 0x1F;
+1092         nic->mii.dev = nic->netdev;
+1093         nic->mii.mdio_read = mdio_read;
+1094         nic->mii.mdio_write = mdio_write;
+1095 }
+1096 
+1097 static int e100_configure(struct nic *nic, struct cb *cb, struct sk_buff *skb)
+1098 {
+1099         struct config *config = &cb->u.config;
+1100         u8 *c = (u8 *)config;
+1101         struct net_device *netdev = nic->netdev;
+1102 
+1103         cb->command = cpu_to_le16(cb_config);
+1104 
+1105         memset(config, 0, sizeof(struct config));
+1106 
+1107         config->byte_count = 0x16;              /* bytes in this struct */
+1108         config->rx_fifo_limit = 0x8;            /* bytes in FIFO before DMA */
+1109         config->direct_rx_dma = 0x1;            /* reserved */
+1110         config->standard_tcb = 0x1;             /* 1=standard, 0=extended */
+1111         config->standard_stat_counter = 0x1;    /* 1=standard, 0=extended */
+1112         config->rx_discard_short_frames = 0x1;  /* 1=discard, 0=pass */
+1113         config->tx_underrun_retry = 0x3;        /* # of underrun retries */
+1114         if (e100_phy_supports_mii(nic))
+1115                 config->mii_mode = 1;           /* 1=MII mode, 0=i82503 mode */
+1116         config->pad10 = 0x6;
+1117         config->no_source_addr_insertion = 0x1; /* 1=no, 0=yes */
+1118         config->preamble_length = 0x2;          /* 0=1, 1=3, 2=7, 3=15 bytes */
+1119         config->ifs = 0x6;                      /* x16 = inter frame spacing */
+1120         config->ip_addr_hi = 0xF2;              /* ARP IP filter - not used */
+1121         config->pad15_1 = 0x1;
+1122         config->pad15_2 = 0x1;
+1123         config->crs_or_cdt = 0x0;               /* 0=CRS only, 1=CRS or CDT */
+1124         config->fc_delay_hi = 0x40;             /* time delay for fc frame */
+1125         config->tx_padding = 0x1;               /* 1=pad short frames */
+1126         config->fc_priority_threshold = 0x7;    /* 7=priority fc disabled */
+1127         config->pad18 = 0x1;
+1128         config->full_duplex_pin = 0x1;          /* 1=examine FDX# pin */
+1129         config->pad20_1 = 0x1F;
