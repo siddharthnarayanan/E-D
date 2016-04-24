@@ -1,0 +1,48 @@
+#include < linux/pci.h >
+
+static int rtl8139_probe (struct net_device *dev, struct pci_dev *pdev)
+{
+	int ret;
+	unsigned char pci_rev;
+
+	if (! pci_present ()) {
+		printk ("No pci device present\n");
+		return -ENODEV;
+	}
+	else  printk ("<0> pci device were found\n");
+	
+	pdev = pci_find_device (PCI_VENDOR_ID_REALTEK, 
+			PCI_DEVICE_ID_REALTEK_8139, pdev);
+	
+	if (pdev)  printk ("probed for rtl 8139 \n");
+	else       printk ("Rtl8193 card not present\n");
+	
+	pci_read_config_byte (pdev, PCI_REVISION_ID, &pci_rev);
+	
+	if (ret = pci_enable_device (pdev)) {
+		printk ("Error enabling the device\n");
+		return ret;
+	}
+	
+	if (pdev->irq < 2) {
+		printk ("Invalid irq number\n");
+		ret = -EIO;
+	}
+	else {
+		printk ("Irq Obtained is %d",pdev->irq); 
+		dev->irq = pdev->irq;
+	}
+	return 0;
+}
+
+int rtl8139_init (struct net_device *dev)
+{
+	int ret;
+	struct pci_dev *pdev = NULL;
+	
+	if ((ret = rtl8139_probe (dev, pdev)) != 0)
+		return ret;
+	
+	dev->open = rtl8139_open;
+	dev->stop = rtl8139_release;
+	dev->hard_start_xmit = rtl8139_
