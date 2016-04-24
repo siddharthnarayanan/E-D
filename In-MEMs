@@ -1,0 +1,22 @@
+define RX_BUF_PAD     16           /* see 11th and 12th bit of RCR: 0x44 */
+#define RX_BUF_WRAP_PAD 2048   /* spare padding to handle pkt wrap */
+#define RX_BUF_TOT_LEN  (RX_BUF_LEN + RX_BUF_PAD + RX_BUF_WRAP_PAD)
+
+/* this we have already done */
+tp->tx_bufs = pci_alloc_consistent(tp->pci_dev, TOTAL_TX_BUF_SIZE, &tp->tx_bufs_dma);
+
+/* add this code to rtl8139_function */
+tp->rx_ring = pci_alloc_consistent(tp->pci_dev, RX_BUF_TOT_LEN, &tp->rx_ring_dma);
+
+if((!tp->tx_bufs)  || (!tp->rx_ring)) {
+        free_irq(dev->irq, dev);
+
+        if(tp->tx_bufs) {
+                       pci_free_consistent(tp->pci_dev, TOTAL_TX_BUF_SIZE, tp->tx_bufs, tp->tx_bufs_dma);
+                       tp->tx_bufs = NULL;
+               }
+        if(tp->rx_ring) {
+                       pci_free_consistent(tp->pci_dev, RX_BUF_TOT_LEN, tp->rx_ring, tp->rx_ring_dma);
+                       tp->rx_ring = NULL;
+               }
+        return -ENOMEM;
